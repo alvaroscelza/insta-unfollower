@@ -1,0 +1,9 @@
+[project]
+name = "insta-unfollower"
+version = "0.1.0"
+description = "Automatically unfollow Instagram accounts that don't follow you back (no official API)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+]

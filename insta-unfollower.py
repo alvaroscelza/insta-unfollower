@@ -1,28 +1,45 @@
 #! /usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import json
 import os
+import pickle
+import random
+import re
 import sys
 import time
-import random
-import requests, pickle
-import json
-import re
 from datetime import datetime
 
-cache_dir = 'cache'
-session_cache = '%s/session.txt' % (cache_dir)
-followers_cache = '%s/followers.json' % (cache_dir)
-following_cache = '%s/following.json' % (cache_dir)
+import requests
 
-instagram_url = 'https://www.instagram.com'
-login_route = '%s/accounts/login/ajax/' % (instagram_url)
-profile_route = '%s/api/v1/users/web_profile_info/' % (instagram_url)
-followers_route = '%s/api/v1/friendships/%s/followers/'
-following_route = '%s/api/v1/friendships/%s/following/'
-unfollow_route = '%s/web/friendships/%s/unfollow/'
+CACHE_DIR = 'cache'
+SESSION_CACHE = '%s/session.txt' % CACHE_DIR
+FOLLOWERS_CACHE = '%s/followers.json' % CACHE_DIR
+FOLLOWING_CACHE = '%s/following.json' % CACHE_DIR
+INSTAGRAM_URL = 'https://www.instagram.com'
+LOGIN_ROUTE = '%s/accounts/login/ajax/' % INSTAGRAM_URL
+PROFILE_ROUTE = '%s/api/v1/users/web_profile_info/' % INSTAGRAM_URL
+FOLLOWERS_ROUTE = '%s/api/v1/friendships/%%s/followers/' % INSTAGRAM_URL
+FOLLOWING_ROUTE = '%s/api/v1/friendships/%%s/following/' % INSTAGRAM_URL
+UNFOLLOW_ROUTE = '%s/web/friendships/%%s/unfollow/' % INSTAGRAM_URL
+RATE_LIMIT_BACKOFF_SECONDS = 600
+# Human-like timing: min/max seconds between actions (jittered)
+PAGINATION_DELAY_MIN = 2.5
+PAGINATION_DELAY_MAX = 6.0
+UNFOLLOW_DELAY_MIN = 6
+UNFOLLOW_DELAY_MAX = 14
+BETWEEN_PAGE_AND_UNFOLLOW_MIN = 2
+BETWEEN_PAGE_AND_UNFOLLOW_MAX = 5
+RETRY_AFTER_FAILURE_MIN = 45
+RETRY_AFTER_FAILURE_MAX = 120
+# Proactive rate limiting
+MIN_SECONDS_BETWEEN_REQUESTS = 2.0
+MAX_REQUESTS_PER_MINUTE = 18
 
-session = requests.Session()
+
+def _human_delay(min_sec, max_sec):
+    """Sleep for a random duration in [min_sec, max_sec] to simulate human behaviour."""
+    time.sleep(random.uniform(min_sec, max_sec))
 
 
 class Credentials:
@@ -30,241 +47,231 @@ class Credentials:
         if os.environ.get('INSTA_USERNAME') and os.environ.get('INSTA_PASSWORD'):
             self.username = os.environ.get('INSTA_USERNAME')
             self.password = os.environ.get('INSTA_PASSWORD')
-        elif len(sys.argv) > 1:
-            self.username = sys.argv[1]
-            self.password = sys.argv[2]
         else:
-            sys.exit('Please provide INSTA_USERNAME and INSTA_PASSWORD environement variables or as an argument as such: ./insta-unfollower.py USERNAME PASSWORD.\nAborting...')
-
-credentials = Credentials()
+            sys.exit('Please set INSTA_USERNAME and INSTA_PASSWORD environment variables.\nAborting...')
 
 
-def init():
-    headers = {
-        'User-Agent': ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36')
-    }
+class InstaUnfollower:
+    def __init__(self, credentials):
+        self._credentials = credentials
+        self._session = requests.Session()
+        self._headers = None
+        self._cookies = None
+        self._request_timestamps = []
 
-    res1 = session.get(instagram_url, headers=headers)
-    ig_app_id = re.findall(r'X-IG-App-ID":"(.*?)"', res1.text)[0]
+    def run(self):
+        if os.environ.get('DRY_RUN'):
+            print('DRY RUN MODE, script will not unfollow users!')
+        self._ensure_cache_dir()
+        self._load_headers_and_cookies()
+        self._load_or_create_session()
+        connected_user = self._get_user_profile(self._credentials.username)
+        print('You\'re now logged as {} ({} followers, {} following)'.format(
+            connected_user['username'], connected_user['edge_followed_by']['count'], connected_user['edge_follow']['count']))
+        _human_delay(2, 4)
+        following_list = self._load_or_build_following_list(connected_user)
+        followers_list = self._load_or_build_followers_list(connected_user)
+        unfollow_users_list = self._users_not_following_back(following_list, followers_list)
+        print('you are following {} user(s) who aren\'t following you:'.format(len(unfollow_users_list)))
+        for user in unfollow_users_list:
+            print(user['username'])
+        if len(unfollow_users_list) > 0:
+            print('Begin to unfollow users...')
+            self._unfollow_all(unfollow_users_list)
+            print(' done')
 
-    res2 = session.get('https://www.instagram.com/data/shared_data/', headers=headers, cookies=res1.cookies)
-    csrf = res2.json()['config']['csrf_token']
-    if csrf:
+    def _ensure_cache_dir(self):
+        if not os.path.isdir(CACHE_DIR):
+            os.makedirs(CACHE_DIR)
+
+    def _load_headers_and_cookies(self):
+        self._headers, self._cookies = self._init_headers_and_cookies()
+
+    def _init_headers_and_cookies(self):
+        headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'}
+        res1 = self._session_get(INSTAGRAM_URL, headers=headers)
+        ig_app_id = re.findall(r'X-IG-App-ID":"(.*?)"', res1.text)[0]
+        res2 = self._session_get('%s/data/shared_data/' % INSTAGRAM_URL, headers=headers, cookies=res1.cookies)
+        csrf = res2.json()['config']['csrf_token']
+        if not csrf:
+            print("No csrf token found in code or empty, maybe you are temp ban? Wait 1 hour and retry")
+            sys.exit(1)
         headers['x-csrftoken'] = csrf
-        # extra needed headers
         headers['accept-language'] = "en-GB,en-US;q=0.9,en;q=0.8,fr;q=0.7,es;q=0.6,es-MX;q=0.5,es-ES;q=0.4"
         headers['x-requested-with'] = "XMLHttpRequest"
         headers['accept'] = "*/*"
         headers['referer'] = "https://www.instagram.com/"
         headers['x-ig-app-id'] = ig_app_id
-        ###
         cookies = res1.cookies.get_dict()
         cookies['csrftoken'] = csrf
-    else:
-        print("No csrf token found in code or empty, maybe you are temp ban? Wait 1 hour and retry")
-        return False
+        _human_delay(2, 6)
+        return headers, cookies
 
-    time.sleep(random.randint(2, 6))
+    def _session_get(self, url, **kwargs):
+        self._wait_before_request()
+        return self._session.get(url, **kwargs)
 
-    return headers, cookies
+    def _session_post(self, url, **kwargs):
+        self._wait_before_request()
+        return self._session.post(url, **kwargs)
 
+    def _wait_before_request(self):
+        self._trim_request_timestamps_to_window()
+        self._sleep_until_under_request_cap()
+        self._sleep_if_needed_for_min_gap()
+        self._record_request_time()
 
-def login(headers, cookies):
-    post_data = {
-        'username': credentials.username,
-        'enc_password': '#PWD_INSTAGRAM_BROWSER:0:{}:{}'.format(int(datetime.now().timestamp()), credentials.password)
-    }
+    def _trim_request_timestamps_to_window(self):
+        now = time.time()
+        self._request_timestamps = [t for t in self._request_timestamps if now - t < 60]
 
-    response = session.post(login_route, headers=headers, data=post_data, cookies=cookies, allow_redirects=True)
-    response_data = json.loads(response.text)
+    def _sleep_until_under_request_cap(self):
+        while len(self._request_timestamps) >= MAX_REQUESTS_PER_MINUTE:
+            time.sleep(1)
+            self._trim_request_timestamps_to_window()
 
-    if 'two_factor_required' in response_data:
-        print('Please disable 2-factor authentication to login.')
-        sys.exit(1)
+    def _sleep_if_needed_for_min_gap(self):
+        if not self._request_timestamps:
+            return
+        elapsed = time.time() - self._request_timestamps[-1]
+        if elapsed < MIN_SECONDS_BETWEEN_REQUESTS:
+            time.sleep(MIN_SECONDS_BETWEEN_REQUESTS - elapsed)
 
-    if 'message' in response_data and response_data['message'] == 'checkpoint_required':
-        print('Please check Instagram app for a security confirmation that it is you trying to login.')
-        sys.exit(1)
+    def _record_request_time(self):
+        self._request_timestamps.append(time.time())
 
-    return response_data['authenticated'], response.cookies.get_dict()
+    def _load_or_create_session(self):
+        if os.path.isfile(SESSION_CACHE):
+            with open(SESSION_CACHE, 'rb') as f:
+                self._session.cookies.update(pickle.load(f))
+            return
+        is_logged, _ = self._login()
+        if not is_logged:
+            sys.exit('login failed, verify user/password combination')
+        with open(SESSION_CACHE, 'wb') as f:
+            pickle.dump(self._session.cookies, f)
+        _human_delay(2, 4)
 
+    def _login(self):
+        post_data = {
+            'username': self._credentials.username,
+            'enc_password': '#PWD_INSTAGRAM_BROWSER:0:{}:{}'.format(int(datetime.now().timestamp()), self._credentials.password)
+        }
+        response = self._session_post(LOGIN_ROUTE, headers=self._headers, data=post_data, cookies=self._cookies, allow_redirects=True)
+        response_data = json.loads(response.text)
+        if 'two_factor_required' in response_data:
+            print('Please disable 2-factor authentication to login.')
+            sys.exit(1)
+        if response_data.get('message') == 'checkpoint_required':
+            print('Please check Instagram app for a security confirmation that it is you trying to login.')
+            sys.exit(1)
+        return response_data['authenticated'], response.cookies.get_dict()
 
-# Note: this endpoint results are not getting updated directly after unfollowing someone
-def get_user_profile(username, headers):
-    response = session.get(profile_route, params={'username': username}, headers=headers).json()
-    return response['data']['user']
+    def _get_user_profile(self, username):
+        response = self._session_get(PROFILE_ROUTE, params={'username': username}, headers=self._headers).json()
+        return response['data']['user']
 
+    def _load_or_build_following_list(self, connected_user):
+        following_list = self._load_json_cache(FOLLOWING_CACHE, 'following list')
+        expected_count = connected_user['edge_follow']['count']
+        if len(following_list) != expected_count:
+            self._print_build_message('following', len(following_list) > 0)
+            following_list = self._get_following_list(connected_user['id'])
+            print(' done')
+            self._save_json_cache(FOLLOWING_CACHE, following_list)
+        return following_list
 
-def get_followers_list(user_id, headers):
-    followers_list = []
+    def _load_json_cache(self, path, label):
+        if not os.path.isfile(path):
+            return []
+        with open(path, 'r') as f:
+            data = json.load(f)
+        print('%s loaded from cache file' % label)
+        return data
 
-    response = session.get(followers_route % (instagram_url, user_id), headers=headers).json()
-    while response['status'] != 'ok':
-        time.sleep(600) # querying too much, sleeping a bit before querying again
-        response = session.get(followers_route % (instagram_url, user_id), headers=headers).json()
+    def _save_json_cache(self, path, data):
+        with open(path, 'w') as f:
+            json.dump(data, f)
 
-    print('.', end='', flush=True)
+    def _print_build_message(self, list_name, rebuilding):
+        prefix = 'rebuilding' if rebuilding else 'building'
+        print('%s %s list...' % (prefix, list_name), end='', flush=True)
 
-    followers_list.extend(response['users'])
+    def _get_following_list(self, user_id):
+        return self._fetch_paginated_users(FOLLOWING_ROUTE % user_id)
 
-    while 'next_max_id' in response:
-        time.sleep(2)
-
-        response = session.get(followers_route % (instagram_url, user_id), params={'max_id': response['next_max_id']}, headers=headers).json()
+    def _fetch_paginated_users(self, route):
+        users = []
+        _human_delay(1, 3)
+        response = self._session_get(route, headers=self._headers).json()
         while response['status'] != 'ok':
-            time.sleep(600) # querying too much, sleeping a bit before querying again
-            response = session.get(followers_route % (instagram_url, user_id), params={'max_id': response['next_max_id']}, headers=headers).json()
-
+            time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
+            response = self._session_get(route, headers=self._headers).json()
         print('.', end='', flush=True)
+        users.extend(response['users'])
+        while 'next_max_id' in response:
+            _human_delay(PAGINATION_DELAY_MIN, PAGINATION_DELAY_MAX)
+            response = self._session_get(route, params={'max_id': response['next_max_id']}, headers=self._headers).json()
+            while response['status'] != 'ok':
+                time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
+                response = self._session_get(route, params={'max_id': response['next_max_id']}, headers=self._headers).json()
+            print('.', end='', flush=True)
+            users.extend(response['users'])
+        return users
 
-        followers_list.extend(response['users'])
+    def _load_or_build_followers_list(self, connected_user):
+        followers_list = self._load_json_cache(FOLLOWERS_CACHE, 'followers list')
+        expected_count = connected_user['edge_followed_by']['count']
+        if len(followers_list) != expected_count:
+            self._print_build_message('followers', len(followers_list) > 0)
+            followers_list = self._get_followers_list(connected_user['id'])
+            print(' done')
+            self._save_json_cache(FOLLOWERS_CACHE, followers_list)
+        return followers_list
 
-    return followers_list
+    def _get_followers_list(self, user_id):
+        return self._fetch_paginated_users(FOLLOWERS_ROUTE % user_id)
 
+    def _users_not_following_back(self, following_list, followers_list):
+        followers_usernames = {u['username'] for u in followers_list}
+        return [u for u in following_list if u['username'] not in followers_usernames]
 
-def get_following_list(user_id, headers):
-    follows_list = []
+    def _unfollow_all(self, unfollow_users_list):
+        for user in unfollow_users_list:
+            if not os.environ.get('UNFOLLOW_VERIFIED') and user.get('is_verified'):
+                print('Skipping {}...'.format(user['username']))
+                continue
+            _human_delay(UNFOLLOW_DELAY_MIN, UNFOLLOW_DELAY_MAX)
+            print('Unfollowing {}...'.format(user['username']))
+            while not self._unfollow(user):
+                sleep_time = random.uniform(RETRY_AFTER_FAILURE_MIN, RETRY_AFTER_FAILURE_MAX)
+                print('Sleeping for {:.0f} seconds before retry...'.format(sleep_time))
+                time.sleep(sleep_time)
 
-    response = session.get(following_route % (instagram_url, user_id), headers=headers).json()
-    while response['status'] != 'ok':
-        time.sleep(600) # querying too much, sleeping a bit before querying again
-        response = session.get(following_route % (instagram_url, user_id), headers=headers).json()
-
-    print('.', end='', flush=True)
-
-    follows_list.extend(response['users'])
-
-    while 'next_max_id' in response:
-        time.sleep(2)
-
-        response = session.get(following_route % (instagram_url, user_id), params={'max_id': response['next_max_id']}, headers=headers).json()
-        while response['status'] != 'ok':
-            time.sleep(600) # querying too much, sleeping a bit before querying again
-            response = session.get(following_route % (instagram_url, user_id), params={'max_id': response['next_max_id']}, headers=headers).json()
-
-        print('.', end='', flush=True)
-
-        follows_list.extend(response['users'])
-
-    return follows_list
-
-
-# TODO: check with the new API
-def unfollow(user):
-    if os.environ.get('DRY_RUN'):
+    def _unfollow(self, user):
+        if os.environ.get('DRY_RUN'):
+            return True
+        profile_page_url = '%s/%s/' % (INSTAGRAM_URL, user['username'])
+        response = self._session_get(profile_page_url, headers=self._headers)
+        _human_delay(BETWEEN_PAGE_AND_UNFOLLOW_MIN, BETWEEN_PAGE_AND_UNFOLLOW_MAX)
+        csrf_match = re.findall(r"csrf_token\":\"(.*?)\"", response.text)
+        if csrf_match:
+            self._session.headers.update({'x-csrftoken': csrf_match[0]})
+        response = self._session_post(UNFOLLOW_ROUTE % user['id'], headers=self._headers)
+        if response.status_code == 429:
+            print('Temporary ban from Instagram. Grab a coffee watch a TV show and comeback later. I will try again...')
+            return False
+        response_data = json.loads(response.text)
+        if response_data['status'] != 'ok':
+            print('Error while trying to unfollow {}. Retrying in a bit...'.format(user['username']))
+            print('ERROR: {}'.format(response.text))
+            return False
         return True
-
-    response = session.get(profile_route % (instagram_url, user['username']))
-    time.sleep(random.randint(2, 4))
-
-    csrf = re.findall(r"csrf_token\":\"(.*?)\"", response.text)[0]
-    if csrf:
-        session.headers.update({
-            'x-csrftoken': csrf
-        })
-
-    response = session.post(unfollow_route % (instagram_url, user['id']))
-
-    if response.status_code == 429: # Too many requests
-        print('Temporary ban from Instagram. Grab a coffee watch a TV show and comeback later. I will try again...')
-        return False
-
-    response = json.loads(response.text)
-
-    if response['status'] != 'ok':
-        print('Error while trying to unfollow {}. Retrying in a bit...'.format(user['username']))
-        print('ERROR: {}'.format(response.text))
-        return False
-    return True
 
 
 def main():
-
-    if os.environ.get('DRY_RUN'):
-        print('DRY RUN MODE, script will not unfollow users!')
-
-    if not os.path.isdir(cache_dir):
-        os.makedirs(cache_dir)
-
-    headers, cookies = init()
-
-    if os.path.isfile(session_cache):
-        with open(session_cache, 'rb') as f:
-            session.cookies.update(pickle.load(f))
-    else:
-        is_logged, cookies = login(headers, cookies)
-        if is_logged == False:
-            sys.exit('login failed, verify user/password combination')
-
-        with open(session_cache, 'wb') as f:
-            pickle.dump(session.cookies, f)
-
-        time.sleep(random.randint(2, 4))
-
-    connected_user = get_user_profile(credentials.username, headers)
-
-    print('You\'re now logged as {} ({} followers, {} following)'.format(connected_user['username'], connected_user['edge_followed_by']['count'], connected_user['edge_follow']['count']))
-
-    time.sleep(random.randint(2, 4))
-
-    following_list = []
-    if os.path.isfile(following_cache):
-        with open(following_cache, 'r') as f:
-            following_list = json.load(f)
-            print('following list loaded from cache file')
-
-    if len(following_list) != connected_user['edge_follow']['count']:
-        if len(following_list) > 0:
-            print('rebuilding following list...', end='', flush=True)
-        else:
-            print('building following list...', end='', flush=True)
-        following_list = get_following_list(connected_user['id'], headers)
-        print(' done')
-
-        with open(following_cache, 'w') as f:
-            json.dump(following_list, f)
-
-    followers_list = []
-    if os.path.isfile(followers_cache):
-        with open(followers_cache, 'r') as f:
-            followers_list = json.load(f)
-            print('followers list loaded from cache file')
-
-    if len(followers_list) != connected_user['edge_followed_by']['count']:
-        if len(following_list) > 0:
-            print('rebuilding followers list...', end='', flush=True)
-        else:
-            print('building followers list...', end='', flush=True)
-        followers_list = get_followers_list(connected_user['id'], headers)
-        print(' done')
-
-        with open(followers_cache, 'w') as f:
-            json.dump(followers_list, f)
-
-    followers_usernames = {user['username'] for user in followers_list}
-    unfollow_users_list = [user for user in following_list if user['username'] not in followers_usernames]
-
-    print('you are following {} user(s) who aren\'t following you:'.format(len(unfollow_users_list)))
-    for user in unfollow_users_list:
-        print(user['username'])
-
-    if len(unfollow_users_list) > 0:
-        print('Begin to unfollow users...')
-
-        for user in unfollow_users_list:
-            if not os.environ.get('UNFOLLOW_VERIFIED') and user['is_verified'] == True:
-                print('Skipping {}...'.format(user['username']))
-                continue
-
-            time.sleep(random.randint(5, 10))
-
-            print('Unfollowing {}...'.format(user['username']))
-            while unfollow(user) == False:
-                sleep_time = random.randint(1, 3) * 1000 # High number on purpose
-                print('Sleeping for {} seconds'.format(sleep_time))
-                time.sleep(sleep_time)
-
-        print(' done')
+    credentials = Credentials()
+    InstaUnfollower(credentials).run()
 
 
 if __name__ == "__main__":

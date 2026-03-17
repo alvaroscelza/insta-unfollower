@@ -1,7 +1,20 @@
-.DS_Store
+# environment variables
+.env
 
 # IDE files
 .idea
 
 # Cache files
 cache
+
+# macOS files
+.DS_Store
+
+# Windows files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux files
+.directory
+.Trash
