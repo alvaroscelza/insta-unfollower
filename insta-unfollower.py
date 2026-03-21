@@ -11,17 +11,22 @@ import time
 from datetime import datetime
 
 import requests
+from dotenv import load_dotenv
 
 CACHE_DIR = 'cache'
-SESSION_CACHE = '%s/session.txt' % CACHE_DIR
-FOLLOWERS_CACHE = '%s/followers.json' % CACHE_DIR
-FOLLOWING_CACHE = '%s/following.json' % CACHE_DIR
+SESSION_CACHE = f'{CACHE_DIR}/session.txt'
+CHECKPOINT_SESSION_CACHE = f'{CACHE_DIR}/session_checkpoint.pkl'
+FOLLOWERS_CACHE = f'{CACHE_DIR}/followers.json'
+FOLLOWING_CACHE = f'{CACHE_DIR}/following.json'
 INSTAGRAM_URL = 'https://www.instagram.com'
-LOGIN_ROUTE = '%s/accounts/login/ajax/' % INSTAGRAM_URL
-PROFILE_ROUTE = '%s/api/v1/users/web_profile_info/' % INSTAGRAM_URL
-FOLLOWERS_ROUTE = '%s/api/v1/friendships/%%s/followers/' % INSTAGRAM_URL
-FOLLOWING_ROUTE = '%s/api/v1/friendships/%%s/following/' % INSTAGRAM_URL
-UNFOLLOW_ROUTE = '%s/web/friendships/%%s/unfollow/' % INSTAGRAM_URL
+# Copied from chrome://version → User-Agent. Chrome reports a reduced version (146.0.0.0) even when
+# the full build is e.g. 146.0.7680.80 on Windows 11. After a major Chrome update, paste the new UA here.
+CHROME_WINDOWS_UA = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
+    'Chrome/146.0.0.0 Safari/537.36'
+)
+LOGIN_ROUTE = f'{INSTAGRAM_URL}/accounts/login/ajax/'
+PROFILE_ROUTE = f'{INSTAGRAM_URL}/api/v1/users/web_profile_info/'
 RATE_LIMIT_BACKOFF_SECONDS = 600
 # Human-like timing: min/max seconds between actions (jittered)
 PAGINATION_DELAY_MIN = 2.5
@@ -66,19 +71,20 @@ class InstaUnfollower:
         self._load_headers_and_cookies()
         self._load_or_create_session()
         connected_user = self._get_user_profile(self._credentials.username)
-        print('You\'re now logged as {} ({} followers, {} following)'.format(
-            connected_user['username'], connected_user['edge_followed_by']['count'], connected_user['edge_follow']['count']))
-        _human_delay(2, 4)
-        following_list = self._load_or_build_following_list(connected_user)
-        followers_list = self._load_or_build_followers_list(connected_user)
-        unfollow_users_list = self._users_not_following_back(following_list, followers_list)
-        print('you are following {} user(s) who aren\'t following you:'.format(len(unfollow_users_list)))
-        for user in unfollow_users_list:
-            print(user['username'])
-        if len(unfollow_users_list) > 0:
-            print('Begin to unfollow users...')
-            self._unfollow_all(unfollow_users_list)
-            print(' done')
+        print(f"You're now logged as {connected_user['username']}")
+        print(f"({connected_user['edge_followed_by']['count']} followers, {connected_user['edge_follow']['count']} following)")
+        # --- Phased run: uncomment the next block when ready (rate-limit friendly) ---
+        # _human_delay(2, 4)
+        # following_list = self._load_or_build_following_list(connected_user)
+        # followers_list = self._load_or_build_followers_list(connected_user)
+        # unfollow_users_list = self._users_not_following_back(following_list, followers_list)
+        # print(f"you are following {len(unfollow_users_list)} user(s) who aren't following you:")
+        # for user in unfollow_users_list:
+        #     print(user['username'])
+        # if len(unfollow_users_list) > 0:
+        #     print('Begin to unfollow users...')
+        #     self._unfollow_all(unfollow_users_list)
+        #     print(' done')
 
     def _ensure_cache_dir(self):
         if not os.path.isdir(CACHE_DIR):
@@ -86,12 +92,13 @@ class InstaUnfollower:
 
     def _load_headers_and_cookies(self):
         self._headers, self._cookies = self._init_headers_and_cookies()
+        requests.utils.add_dict_to_cookiejar(self._session.cookies, self._cookies)
 
     def _init_headers_and_cookies(self):
-        headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'}
+        headers = {'User-Agent': CHROME_WINDOWS_UA}
         res1 = self._session_get(INSTAGRAM_URL, headers=headers)
         ig_app_id = re.findall(r'X-IG-App-ID":"(.*?)"', res1.text)[0]
-        res2 = self._session_get('%s/data/shared_data/' % INSTAGRAM_URL, headers=headers, cookies=res1.cookies)
+        res2 = self._session_get(f'{INSTAGRAM_URL}/data/shared_data/', headers=headers, cookies=res1.cookies)
         csrf = res2.json()['config']['csrf_token']
         if not csrf:
             print("No csrf token found in code or empty, maybe you are temp ban? Wait 1 hour and retry")
@@ -145,27 +152,57 @@ class InstaUnfollower:
             with open(SESSION_CACHE, 'rb') as f:
                 self._session.cookies.update(pickle.load(f))
             return
+        if os.path.isfile(CHECKPOINT_SESSION_CACHE):
+            with open(CHECKPOINT_SESSION_CACHE, 'rb') as f:
+                self._session.cookies.update(pickle.load(f))
+            self._sync_csrf_header_from_session()
         is_logged, _ = self._login()
         if not is_logged:
             sys.exit('login failed, verify user/password combination')
+        if os.path.isfile(CHECKPOINT_SESSION_CACHE):
+            os.remove(CHECKPOINT_SESSION_CACHE)
         with open(SESSION_CACHE, 'wb') as f:
             pickle.dump(self._session.cookies, f)
         _human_delay(2, 4)
 
+    def _sync_csrf_header_from_session(self):
+        csrf = self._session.cookies.get_dict().get('csrftoken') or self._cookies.get('csrftoken')
+        if csrf:
+            self._headers['x-csrftoken'] = csrf
+
     def _login(self):
+        self._sync_csrf_header_from_session()
         post_data = {
             'username': self._credentials.username,
-            'enc_password': '#PWD_INSTAGRAM_BROWSER:0:{}:{}'.format(int(datetime.now().timestamp()), self._credentials.password)
+            'enc_password': f'#PWD_INSTAGRAM_BROWSER:0:{int(datetime.now().timestamp())}:{self._credentials.password}'
         }
-        response = self._session_post(LOGIN_ROUTE, headers=self._headers, data=post_data, cookies=self._cookies, allow_redirects=True)
-        response_data = json.loads(response.text)
+        # Do not pass cookies= here: explicit cookies override the session jar and would replace
+        # checkpoint cookies with a fresh homepage csrftoken after load_dotenv / second run.
+        response = self._session_post(LOGIN_ROUTE, headers=self._headers, data=post_data, allow_redirects=True)
+        response_data = self._parse_login_json(response)
         if 'two_factor_required' in response_data:
             print('Please disable 2-factor authentication to login.')
             sys.exit(1)
         if response_data.get('message') == 'checkpoint_required':
-            print('Please check Instagram app for a security confirmation that it is you trying to login.')
+            with open(CHECKPOINT_SESSION_CACHE, 'wb') as f:
+                pickle.dump(self._session.cookies, f)
+            print('Instagram needs you to confirm this login (checkpoint).')
+            print('Approve it in the Instagram app, then run this script again — the next run retries the same attempt instead of starting from scratch.')
             sys.exit(1)
         return response_data['authenticated'], response.cookies.get_dict()
+
+    def _parse_login_json(self, response):
+        text = (response.text or '').strip()
+        if not text:
+            print(f'Login response was empty (HTTP {response.status_code}). Try deleting cache/session_checkpoint.pkl and cache/session.txt, then run again.')
+            sys.exit(1)
+        try:
+            return json.loads(response.text)
+        except json.JSONDecodeError:
+            preview = text[:300].replace('\n', ' ')
+            print(f'Login response was not JSON (HTTP {response.status_code}): {preview!r}...')
+            print('If you were in a checkpoint flow, delete cache/session_checkpoint.pkl and try again, or complete login in a browser.')
+            sys.exit(1)
 
     def _get_user_profile(self, username):
         response = self._session_get(PROFILE_ROUTE, params={'username': username}, headers=self._headers).json()
@@ -186,7 +223,7 @@ class InstaUnfollower:
             return []
         with open(path, 'r') as f:
             data = json.load(f)
-        print('%s loaded from cache file' % label)
+        print(f'{label} loaded from cache file')
         return data
 
     def _save_json_cache(self, path, data):
@@ -195,10 +232,10 @@ class InstaUnfollower:
 
     def _print_build_message(self, list_name, rebuilding):
         prefix = 'rebuilding' if rebuilding else 'building'
-        print('%s %s list...' % (prefix, list_name), end='', flush=True)
+        print(f'{prefix} {list_name} list...', end='', flush=True)
 
     def _get_following_list(self, user_id):
-        return self._fetch_paginated_users(FOLLOWING_ROUTE % user_id)
+        return self._fetch_paginated_users(f'{INSTAGRAM_URL}/api/v1/friendships/{user_id}/following/')
 
     def _fetch_paginated_users(self, route):
         users = []
@@ -230,7 +267,7 @@ class InstaUnfollower:
         return followers_list
 
     def _get_followers_list(self, user_id):
-        return self._fetch_paginated_users(FOLLOWERS_ROUTE % user_id)
+        return self._fetch_paginated_users(f'{INSTAGRAM_URL}/api/v1/friendships/{user_id}/followers/')
 
     def _users_not_following_back(self, following_list, followers_list):
         followers_usernames = {u['username'] for u in followers_list}
@@ -239,37 +276,38 @@ class InstaUnfollower:
     def _unfollow_all(self, unfollow_users_list):
         for user in unfollow_users_list:
             if not os.environ.get('UNFOLLOW_VERIFIED') and user.get('is_verified'):
-                print('Skipping {}...'.format(user['username']))
+                print(f"Skipping {user['username']}...")
                 continue
             _human_delay(UNFOLLOW_DELAY_MIN, UNFOLLOW_DELAY_MAX)
-            print('Unfollowing {}...'.format(user['username']))
+            print(f"Unfollowing {user['username']}...")
             while not self._unfollow(user):
                 sleep_time = random.uniform(RETRY_AFTER_FAILURE_MIN, RETRY_AFTER_FAILURE_MAX)
-                print('Sleeping for {:.0f} seconds before retry...'.format(sleep_time))
+                print(f'Sleeping for {sleep_time:.0f} seconds before retry...')
                 time.sleep(sleep_time)
 
     def _unfollow(self, user):
         if os.environ.get('DRY_RUN'):
             return True
-        profile_page_url = '%s/%s/' % (INSTAGRAM_URL, user['username'])
+        profile_page_url = f"{INSTAGRAM_URL}/{user['username']}/"
         response = self._session_get(profile_page_url, headers=self._headers)
         _human_delay(BETWEEN_PAGE_AND_UNFOLLOW_MIN, BETWEEN_PAGE_AND_UNFOLLOW_MAX)
         csrf_match = re.findall(r"csrf_token\":\"(.*?)\"", response.text)
         if csrf_match:
             self._session.headers.update({'x-csrftoken': csrf_match[0]})
-        response = self._session_post(UNFOLLOW_ROUTE % user['id'], headers=self._headers)
+        response = self._session_post(f"{INSTAGRAM_URL}/web/friendships/{user['id']}/unfollow/", headers=self._headers)
         if response.status_code == 429:
             print('Temporary ban from Instagram. Grab a coffee watch a TV show and comeback later. I will try again...')
             return False
         response_data = json.loads(response.text)
         if response_data['status'] != 'ok':
-            print('Error while trying to unfollow {}. Retrying in a bit...'.format(user['username']))
-            print('ERROR: {}'.format(response.text))
+            print(f"Error while trying to unfollow {user['username']}. Retrying in a bit...")
+            print(f'ERROR: {response.text}')
             return False
         return True
 
 
 def main():
+    load_dotenv()
     credentials = Credentials()
     InstaUnfollower(credentials).run()
 
