@@ -22,6 +22,43 @@ const whitelistListEl = document.getElementById('whitelistList');
 const whitelistCountEl = document.getElementById('whitelistCount');
 
 let whitelistUsernames = [];
+let tabJobPollId = null;
+
+function clearTabJobPoll() {
+  if (tabJobPollId != null) {
+    clearInterval(tabJobPollId);
+    tabJobPollId = null;
+  }
+}
+
+const TAB_JOB_SESSION_KEYS = [
+  '__ig_unfollow_log__',
+  '__ig_unfollow_status__',
+  '__ig_load_progress__',
+  '__ig_unfollow_lock__',
+];
+
+function startTabJobPoll(tabId) {
+  clearTabJobPoll();
+  tabJobPollId = setInterval(async () => {
+    try {
+      const snap = await readTabSession(tabId, TAB_JOB_SESSION_KEYS);
+      const logText = snap.__ig_unfollow_log__ || '';
+      logEl.textContent = logText;
+      logEl.scrollTop = logEl.scrollHeight;
+      setLoadProgressUi(snap.__ig_load_progress__);
+      const st = snap.__ig_unfollow_status__ || '';
+      const locked = snap.__ig_unfollow_lock__ === '1';
+      if (!locked && st !== 'running' && st !== 'starting') {
+        clearTabJobPoll();
+        hideLoadProgressUi();
+        await syncUiFromTab(tabId);
+      }
+    } catch {
+      clearTabJobPoll();
+    }
+  }, 600);
+}
 
 function normalizeUsername(raw) {
   return String(raw || '')
@@ -282,15 +319,36 @@ async function syncUiFromTab(tabId) {
     '__ig_unfollowers_count__',
     '__ig_count_following__',
     '__ig_count_followers__',
+    '__ig_unfollow_log__',
+    '__ig_unfollow_status__',
+    '__ig_load_progress__',
+    '__ig_unfollow_lock__',
   ]);
   if (s.__ig_session_username__) whoEl.textContent = '@' + s.__ig_session_username__;
   if (s.__ig_count_following__) followingCountEl.textContent = s.__ig_count_following__;
   if (s.__ig_count_followers__) followersCountEl.textContent = s.__ig_count_followers__;
   if (s.__ig_unfollowers_count__) unfollowersCountEl.textContent = s.__ig_unfollowers_count__;
   else if (s.__ig_unfollowers_ready__ !== '1') unfollowersCountEl.textContent = '—';
-  const hasUser = !!s.__ig_session_user_id__;
-  btnLoadUnfollowers.disabled = !hasUser;
-  setUnfollowersCacheUi(s.__ig_unfollowers_ready__ === '1');
+  logEl.textContent = s.__ig_unfollow_log__ || '';
+  logEl.scrollTop = logEl.scrollHeight;
+  const status = s.__ig_unfollow_status__ || '';
+  const locked = s.__ig_unfollow_lock__ === '1';
+  const jobActive = locked || status === 'running' || status === 'starting';
+  if (jobActive) {
+    setLoadProgressUi(s.__ig_load_progress__);
+    btnRefreshCounts.disabled = true;
+    btnLoadUnfollowers.disabled = true;
+    btnUnfollow.disabled = true;
+    btnDownloadUnfollowers.disabled = true;
+    startTabJobPoll(tabId);
+  } else {
+    clearTabJobPoll();
+    hideLoadProgressUi();
+    btnRefreshCounts.disabled = false;
+    const hasUser = !!s.__ig_session_user_id__;
+    btnLoadUnfollowers.disabled = !hasUser;
+    setUnfollowersCacheUi(s.__ig_unfollowers_ready__ === '1');
+  }
 }
 
 async function getActiveInstagramTab() {
@@ -347,10 +405,13 @@ async function pollProgress(tabId) {
 }
 
 async function runPhase(tabId, config) {
+  clearTabJobPoll();
   btnRefreshCounts.disabled = true;
   btnLoadUnfollowers.disabled = true;
   btnUnfollow.disabled = true;
   btnDownloadUnfollowers.disabled = true;
+  let logTailAfterSync = null;
+  let parsedResult = null;
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
@@ -371,23 +432,22 @@ async function runPhase(tabId, config) {
     });
     const { status, resultJson } = await pollProgress(tabId);
     if (status === 'timeout') {
-      appendLog(logEl.textContent + '\n[Polling stopped after 1h]');
+      logTailAfterSync = '\n[Polling stopped after 1h]';
       return { ok: false, timeout: true, obj: null };
     }
-    let obj = null;
     if (resultJson) {
       try {
-        obj = JSON.parse(resultJson);
+        parsedResult = JSON.parse(resultJson);
+        logTailAfterSync = '\n---\n' + JSON.stringify(parsedResult, null, 2);
       } catch {
-        appendLog(logEl.textContent + '\n---\n' + resultJson);
+        logTailAfterSync = '\n---\n' + resultJson;
       }
     }
-    if (obj) appendLog(logEl.textContent + '\n---\n' + JSON.stringify(obj, null, 2));
-    const ok = status === 'done' && obj && obj.ok === true;
-    return { ok, obj, status };
+    const ok = status === 'done' && parsedResult && parsedResult.ok === true;
+    return { ok, obj: parsedResult, status };
   } finally {
     await syncUiFromTab(tabId);
-    btnRefreshCounts.disabled = false;
+    if (logTailAfterSync) appendLog(logEl.textContent + logTailAfterSync);
   }
 }
 
@@ -463,6 +523,7 @@ if (whitelistInput) {
 }
 
 async function initPopup() {
+  clearTabJobPoll();
   await loadWhitelistFromStorage();
   renderWhitelistList();
   showTab('main');
@@ -482,6 +543,8 @@ async function initPopup() {
   const s = await readTabSession(tab.id, ['__ig_session_username__']);
   if (!s.__ig_session_username__) await runCountsFlow();
 }
+
+window.addEventListener('pagehide', () => clearTabJobPoll());
 
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', initPopup);
