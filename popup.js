@@ -188,14 +188,26 @@ function formatLoadProgressLine(progressJson, nowMs) {
     return { main: '(Unreadable progress)', sub: '', hint: '' };
   }
   const ageSec = (nowMs - (p.lastActivityAt || 0)) / 1000;
-  const listLabel =
-    p.list === 'following' ? 'Following' : p.list === 'followers' ? 'Followers' : p.list === 'both' ? 'Both lists' : '';
-  const parts = [];
-  if (listLabel) parts.push(listLabel);
-  if (typeof p.loaded === 'number') parts.push(p.loaded.toLocaleString() + ' accounts');
-  if (typeof p.page === 'number' && p.page > 0) parts.push('page ' + p.page);
-  if (p.detail) parts.push(p.detail);
-  const main = parts.join(' · ');
+  let main = '';
+  if (p.job === 'unfollow') {
+    const parts = ['Unfollow'];
+    if (typeof p.current === 'number' && typeof p.total === 'number') {
+      parts.push(p.current + '/' + p.total);
+    }
+    if (p.activeUser) parts.push('@' + String(p.activeUser));
+    if (typeof p.cacheRemaining === 'number') parts.push(p.cacheRemaining + ' in cache');
+    if (p.detail) parts.push(p.detail);
+    main = parts.join(' · ');
+  } else {
+    const listLabel =
+      p.list === 'following' ? 'Following' : p.list === 'followers' ? 'Followers' : p.list === 'both' ? 'Both lists' : '';
+    const parts = [];
+    if (listLabel) parts.push(listLabel);
+    if (typeof p.loaded === 'number') parts.push(p.loaded.toLocaleString() + ' accounts');
+    if (typeof p.page === 'number' && p.page > 0) parts.push('page ' + p.page);
+    if (p.detail) parts.push(p.detail);
+    main = parts.join(' · ');
+  }
   const ageStr =
     ageSec < 1.5
       ? 'Last activity: just now'
@@ -203,11 +215,25 @@ function formatLoadProgressLine(progressJson, nowMs) {
         ? 'Last activity: ' + Math.round(ageSec) + 's ago'
         : 'Last activity: ' + Math.round(ageSec / 60) + 'm ago';
   let hint = '';
-  if (p.step === 'http_in_flight' && ageSec > 50) {
-    hint =
-      'No heartbeat while waiting on the network — large lists can take a while. If this stays several minutes, check the Instagram tab or your connection.';
-  } else if (p.step !== 'rate_limit_backoff' && ageSec > 120) {
-    hint = 'No updates for a while — job may be stuck; try Stop, then reload instagram.com.';
+  if (p.job === 'unfollow') {
+    if ((p.step === 'fetch_profile' || p.step === 'unfollow_post') && ageSec > 50) {
+      hint =
+        'No heartbeat while waiting on the network — if this stays high, check the Instagram tab or your connection.';
+    } else if (
+      ageSec > 120 &&
+      p.step !== 'delay_before' &&
+      p.step !== 'delay_before_post' &&
+      p.step !== 'rate_limit'
+    ) {
+      hint = 'No updates for a while — job may be stuck; try Stop, then reload instagram.com.';
+    }
+  } else {
+    if (p.step === 'http_in_flight' && ageSec > 50) {
+      hint =
+        'No heartbeat while waiting on the network — large lists can take a while. If this stays several minutes, check the Instagram tab or your connection.';
+    } else if (p.step !== 'rate_limit_backoff' && ageSec > 120) {
+      hint = 'No updates for a while — job may be stuck; try Stop, then reload instagram.com.';
+    }
   }
   return { main, sub: ageStr, hint };
 }
@@ -415,7 +441,6 @@ async function runUnfollowFlow() {
   appendLog('Unfollow phase (from cache)…\n');
   await runPhase(tab.id, {
     command: 'unfollow',
-    unfollowVerified: document.getElementById('unfollowVerified').checked,
     whitelist: [...whitelistUsernames],
   });
 }

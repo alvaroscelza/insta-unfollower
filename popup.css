@@ -247,19 +247,6 @@ input[type="text"] {
   font: inherit;
 }
 
-.check {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  margin-bottom: 8px;
-  cursor: pointer;
-  line-height: 1.3;
-}
-
-.check input {
-  margin-top: 2px;
-}
-
 .primary {
   width: 100%;
   margin-top: 2px;

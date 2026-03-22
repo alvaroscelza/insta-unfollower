@@ -1,6 +1,6 @@
 /**
  * Runs in the page main world on instagram.com. Config JSON in sessionStorage __ig_unfollow__:
- * { command: 'counts' | 'load_unfollowers' | 'unfollow', unfollowVerified?, whitelist?: string[] }
+ * { command: 'counts' | 'load_unfollowers' | 'unfollow', whitelist?: string[] }
  */
 'use strict';
 
@@ -61,7 +61,7 @@ class InstaUnfollowRunner {
             } else if (command === 'load_unfollowers') {
                 await this.runLoadUnfollowers();
             } else if (command === 'unfollow') {
-                await this.runUnfollow(!!config.unfollowVerified, Array.isArray(config.whitelist) ? config.whitelist : []);
+                await this.runUnfollow(Array.isArray(config.whitelist) ? config.whitelist : []);
             } else {
                 throw new Error('Unknown command: ' + command);
             }
@@ -124,6 +124,53 @@ class InstaUnfollowRunner {
 
     clearLoadProgress() {
         sessionStorage.removeItem(SK_LOAD_PROGRESS);
+    }
+
+    countUnfollowersInCache() {
+        try {
+            const raw = sessionStorage.getItem(SK_UNFOLLOWERS_LIST);
+            if (!raw) return 0;
+            const a = JSON.parse(raw);
+            return Array.isArray(a) ? a.length : 0;
+        } catch {
+            return 0;
+        }
+    }
+
+    normalizeUsernameKey(u) {
+        return u && u.username != null ? String(u.username).trim().replace(/^@+/, '').toLowerCase() : '';
+    }
+
+    userPkOrId(u) {
+        if (!u || typeof u !== 'object') return '';
+        const v = u.pk != null ? u.pk : u.id;
+        return v != null ? String(v) : '';
+    }
+
+    removeUserFromUnfollowersCache(user) {
+        const uname = this.normalizeUsernameKey(user);
+        const uid = this.userPkOrId(user);
+        let raw = sessionStorage.getItem(SK_UNFOLLOWERS_LIST);
+        if (!raw) return;
+        let list;
+        try {
+            list = JSON.parse(raw);
+        } catch {
+            return;
+        }
+        if (!Array.isArray(list)) return;
+        const next = list.filter((entry) => {
+            const ename = this.normalizeUsernameKey(entry);
+            const eid = this.userPkOrId(entry);
+            if (uname && ename === uname) return false;
+            if (uid && eid && uid === eid) return false;
+            return true;
+        });
+        sessionStorage.setItem(SK_UNFOLLOWERS_LIST, JSON.stringify(next));
+        sessionStorage.setItem(SK_UNFOLLOWERS_COUNT, String(next.length));
+        if (next.length === 0) {
+            sessionStorage.setItem(SK_UNFOLLOWERS_READY, '0');
+        }
     }
 
     async runCounts() {
@@ -372,6 +419,7 @@ class InstaUnfollowRunner {
             const userId = sessionStorage.getItem(SK_USER_ID);
             if (!userId) throw new Error('Load profile first (Refresh counts) before loading unfollowers.');
             this.setLoadProgress({
+                job: 'load',
                 list: 'following',
                 loaded: 0,
                 page: 0,
@@ -525,7 +573,7 @@ class InstaUnfollowRunner {
         return following.filter((u) => !followerNames.has(u.username));
     }
 
-    async runUnfollow(unfollowVerified, whitelistUsernames) {
+    async runUnfollow(whitelistUsernames) {
         if (sessionStorage.getItem(SK_UNFOLLOWERS_READY) !== '1') {
             throw new Error('Run “Load Unfollowers” first to build the cache.');
         }
@@ -545,33 +593,65 @@ class InstaUnfollowRunner {
         );
         this.log('Unfollowing from cache: ' + targets.length + ' account(s)');
         targets.forEach((u) => this.log('  @' + u.username));
-        let skippedVerified = 0;
         let skippedWhitelist = 0;
         let unfollowed = 0;
         let failed = 0;
+        const total = targets.length;
         try {
-            for (const u of targets) {
+            this.setLoadProgress({
+                job: 'unfollow',
+                total,
+                current: 0,
+                cacheRemaining: this.countUnfollowersInCache(),
+                step: 'starting',
+                detail: 'Starting unfollow run',
+            });
+            for (let i = 0; i < targets.length; i++) {
+                const u = targets[i];
+                const current = i + 1;
                 this.throwIfCancelled();
+                this.setLoadProgress({
+                    job: 'unfollow',
+                    total,
+                    current,
+                    activeUser: u.username,
+                    cacheRemaining: this.countUnfollowersInCache(),
+                    step: 'account',
+                    detail: 'Account ' + current + ' of ' + total,
+                });
                 const uname = u && u.username != null ? String(u.username).trim().replace(/^@+/, '').toLowerCase() : '';
                 if (uname && whitelistSet.has(uname)) {
                     this.log('Skip whitelist @' + u.username);
                     skippedWhitelist++;
+                    this.setLoadProgress({
+                        job: 'unfollow',
+                        total,
+                        current,
+                        activeUser: u.username,
+                        cacheRemaining: this.countUnfollowersInCache(),
+                        step: 'skipped_whitelist',
+                        detail: 'Skipped (whitelist)',
+                    });
                     continue;
                 }
-                if (!unfollowVerified && u.is_verified) {
-                    this.log('Skip verified @' + u.username);
-                    skippedVerified++;
-                    continue;
-                }
-                const ok = await this.unfollowOne(u);
+                const ok = await this.unfollowOne(u, current, total);
                 if (ok) unfollowed++;
                 else failed++;
-                if (!ok) await this.interruptibleSleep(this.randomBetween(45_000, 120_000));
+                this.setLoadProgress({
+                    job: 'unfollow',
+                    total,
+                    current,
+                    activeUser: u.username,
+                    cacheRemaining: this.countUnfollowersInCache(),
+                    step: ok ? 'done_user' : 'failed_user',
+                    detail: ok ? 'Unfollowed @' + u.username : 'Failed or skipped @' + u.username,
+                });
+                if (!ok) await this.interruptibleSleep(this.randomBetween(45_000, 120_000), () => this.bumpLoadProgress());
             }
             this.setResult({
                 ok: true,
                 command: 'unfollow',
-                summary: { targets: targets.length, skippedVerified, skippedWhitelist, unfollowed, failed },
+                summary: { targets: targets.length, skippedWhitelist, unfollowed, failed },
             });
             this.log('Done.');
         } catch (e) {
@@ -581,34 +661,74 @@ class InstaUnfollowRunner {
                     ok: false,
                     cancelled: true,
                     command: 'unfollow',
-                    summary: { targets: targets.length, skippedVerified, skippedWhitelist, unfollowed, failed },
+                    summary: { targets: targets.length, skippedWhitelist, unfollowed, failed },
                 });
                 this.log('Done.');
                 return;
             }
             throw e;
+        } finally {
+            this.clearLoadProgress();
         }
     }
 
-    async unfollowOne(user) {
-        await this.interruptibleSleep(this.randomBetween(UNFOLLOW_MIN, UNFOLLOW_MAX));
+    async unfollowOne(user, current, total) {
+        const baseProgress = () => ({
+            job: 'unfollow',
+            total,
+            current,
+            activeUser: user.username,
+            cacheRemaining: this.countUnfollowersInCache(),
+        });
+        this.setLoadProgress({
+            ...baseProgress(),
+            step: 'delay_before',
+            detail: 'Pause before profile request',
+        });
+        await this.interruptibleSleep(this.randomBetween(UNFOLLOW_MIN, UNFOLLOW_MAX), () => this.bumpLoadProgress());
+        this.setLoadProgress({
+            ...baseProgress(),
+            step: 'fetch_profile',
+            detail: 'Loading profile page',
+        });
         const pageRes = await this.apiFetch(ORIGIN + '/' + user.username + '/', { method: 'GET' });
         const html = await pageRes.text();
+        this.bumpLoadProgress();
         const csrfMatch =
             html.match(/"csrf_token":"([^"]+)"/) ||
             html.match(/csrf_token\\":\\"(.*?)\\"/);
-        await this.interruptibleSleep(this.randomBetween(BETWEEN_PAGE_UNFOLLOW_MIN, BETWEEN_PAGE_UNFOLLOW_MAX));
+        this.setLoadProgress({
+            ...baseProgress(),
+            step: 'delay_before_post',
+            detail: 'Pause before unfollow request',
+        });
+        await this.interruptibleSleep(this.randomBetween(BETWEEN_PAGE_UNFOLLOW_MIN, BETWEEN_PAGE_UNFOLLOW_MAX), () =>
+            this.bumpLoadProgress(),
+        );
         const csrf = csrfMatch ? csrfMatch[1] : this.getCsrfToken();
+        this.setLoadProgress({
+            ...baseProgress(),
+            step: 'rate_limit',
+            detail: 'Spacing API calls',
+        });
         await this.waitForRateLimit();
+        this.bumpLoadProgress();
         const unfollowHeaders = await this.buildIgHeaders({
             referer: ORIGIN + '/' + user.username + '/',
             'x-csrftoken': csrf,
         });
-        const res = await fetch(ORIGIN + '/web/friendships/' + user.id + '/unfollow/', {
+        const friendshipId = user.pk != null ? user.pk : user.id;
+        this.setLoadProgress({
+            ...baseProgress(),
+            step: 'unfollow_post',
+            detail: 'Sending unfollow',
+        });
+        const res = await fetch(ORIGIN + '/web/friendships/' + friendshipId + '/unfollow/', {
             method: 'POST',
             credentials: 'include',
             headers: unfollowHeaders,
         });
+        this.bumpLoadProgress();
         if (res.status === 429) {
             this.log('429 on unfollow ' + user.username + ' — wait and retry later');
             return false;
@@ -623,6 +743,7 @@ class InstaUnfollowRunner {
             this.log('Unfollow failed ' + user.username + ': ' + JSON.stringify(body).slice(0, 200));
             return false;
         }
+        this.removeUserFromUnfollowersCache(user);
         this.log('Unfollowed ' + user.username);
         return true;
     }

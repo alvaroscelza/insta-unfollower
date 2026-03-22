@@ -39,7 +39,7 @@
     <button type="button" id="btnDownloadUnfollowers" class="secondary" disabled>Download unfollowers (.txt)</button>
 
     <div id="loadProgress" class="load-progress" hidden aria-live="polite">
-      <div class="load-progress-label">Load progress</div>
+      <div class="load-progress-label">Progress</div>
       <pre id="loadProgressText" class="load-progress-text"></pre>
     </div>
 
@@ -47,10 +47,6 @@
     <p class="stop-hint">Sets a cancel flag in the Instagram tab; long waits and between-page pauses stop within ~1s. A request already in flight may still finish.</p>
 
     <p class="section-label">Unfollow step</p>
-    <label class="check">
-      <input type="checkbox" id="unfollowVerified" />
-      <span>Also unfollow verified accounts</span>
-    </label>
     <button type="button" id="btnUnfollow" class="primary" disabled>Unfollow non-followers</button>
 
     <pre id="log" aria-live="polite"></pre>
