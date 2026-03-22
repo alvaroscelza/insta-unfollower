@@ -1,11 +1,13 @@
-# environment variables
+# environment / local secrets
 .env
 
 # IDE files
 .idea
 
-# Cache files
-cache
+# Python (leftover local envs from old script workflow)
+.venv
+__pycache__
+*.pyc
 
 # macOS files
 .DS_Store
