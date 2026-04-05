@@ -2,16 +2,16 @@
  * Runs in the page main world on instagram.com. Config JSON in sessionStorage __ig_unfollow__:
  * { command: 'counts' | 'load_unfollowers' | 'unfollow', whitelist?: string[] }
  */
+(function () {
 'use strict';
 
 const ORIGIN = 'https://www.instagram.com';
-const RATE_LIMIT_MS = 600_000;
 const MIN_GAP_MS = 2000;
 const MAX_PER_MIN = 18;
-const PAGINATION_MIN = 2500;
-const PAGINATION_MAX = 6000;
-const UNFOLLOW_MIN = 6000;
-const UNFOLLOW_MAX = 14_000;
+const PAGINATION_MIN = 2000;
+const PAGINATION_MAX = 4000;
+const UNFOLLOW_MIN = 4000;
+const UNFOLLOW_MAX = 10_000;
 const BETWEEN_PAGE_UNFOLLOW_MIN = 2000;
 const BETWEEN_PAGE_UNFOLLOW_MAX = 5000;
 const FRIENDSHIP_PAGE_COUNT = 200;
@@ -55,6 +55,7 @@ class InstaUnfollowRunner {
             return;
         }
         const command = config.command || 'counts';
+        this.log('Starting: ' + command + '…');
         try {
             if (command === 'counts') {
                 await this.runCounts();
@@ -207,39 +208,10 @@ class InstaUnfollowRunner {
     }
 
     async requireLoggedInUser() {
-        const { data, res } = await this.getJson('/api/v1/accounts/current_user/');
-        if (res.ok) {
-            const user = this.extractSessionUserFromPayload(data);
-            if (user) return user;
-            if (data.message === 'login_required' || data.require_login) {
-                throw new Error('Instagram says login is required — reload instagram.com, sign in, then try Refresh counts again.');
-            }
-            if (data.status === 'fail') {
-                throw new Error(
-                    (data.message || 'Instagram API refused current_user.') +
-                        ' Reload the tab or wait a few minutes if you were rate-limited.',
-                );
-            }
-        }
         const fromForm = await this.tryEditWebFormUser();
         if (fromForm) return fromForm;
-        if (!res.ok) {
-            const msg =
-                (data && (data.message || data.error)) ||
-                'Instagram rejected the request';
-            throw new Error(
-                msg +
-                    ' (HTTP ' +
-                    res.status +
-                    '). Reload the extension on chrome://extensions, hard-refresh instagram.com, and disable extensions that change the User-Agent or request headers.',
-            );
-        }
-        const snippet = JSON.stringify(data).slice(0, 320);
         throw new Error(
-            'Could not read your account from Instagram APIs (you may still be logged in in the UI). ' +
-                'Try: hard-refresh instagram.com (Ctrl+Shift+R), stay on www.instagram.com, then Refresh counts. ' +
-                'Debug: current_user → ' +
-                snippet,
+            'Could not read your account from Instagram (sign in on instagram.com, then hard-refresh and try Refresh counts again).',
         );
     }
 
@@ -366,30 +338,6 @@ class InstaUnfollowRunner {
         return { ...raw, pk, username };
     }
 
-    extractSessionUserFromPayload(data) {
-        if (!data || typeof data !== 'object') return null;
-        const candidates = [
-            data.user,
-            data.logged_in_user,
-            data.viewer,
-            data.data && data.data.user,
-            data.data && data.data.viewer,
-        ];
-        for (const c of candidates) {
-            const u = this.normalizeSessionUser(c);
-            if (u && u.username && u.pk != null) return u;
-        }
-        for (const c of candidates) {
-            const u = this.normalizeSessionUser(c);
-            if (u && u.pk != null) return u;
-        }
-        for (const c of candidates) {
-            const u = this.normalizeSessionUser(c);
-            if (u && u.username) return u;
-        }
-        return null;
-    }
-
     async tryEditWebFormUser() {
         let formUsername = '';
         let formPk = null;
@@ -483,7 +431,7 @@ class InstaUnfollowRunner {
             step: 'between_pages',
             detail: 'Short pause before first page',
         });
-        await this.interruptibleSleep(this.randomBetween(1000, 3000), () => this.bumpLoadProgress());
+        await this.interruptibleSleep(this.randomBetween(300, 800), () => this.bumpLoadProgress());
         page = 1;
         this.setLoadProgress({
             list: listKind,
@@ -537,35 +485,34 @@ class InstaUnfollowRunner {
     }
 
     async getFriendshipPage(pathWithQuery) {
-        const maxAttempts = 30;
-        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const tryOnce = async () => {
             this.throwIfCancelled();
             this.bumpLoadProgress();
-            const { data, res } = await this.getJson(pathWithQuery);
+            const out = await this.getJson(pathWithQuery);
             this.bumpLoadProgress();
-            if (!res.ok) {
-                this.log('Friendship HTTP ' + res.status + ', backing off 10m… (attempt ' + (attempt + 1) + '/' + maxAttempts + ')');
-                this.setLoadProgress({
-                    step: 'rate_limit_backoff',
-                    detail: 'HTTP ' + res.status + ' — waiting ~10 min, retry ' + (attempt + 1) + '/' + maxAttempts,
-                    backoffAttempt: attempt + 1,
-                    backoffMax: maxAttempts,
-                });
-                await this.interruptibleSleep(RATE_LIMIT_MS, () => this.bumpLoadProgress());
-                continue;
-            }
-            if (data && data.status === 'ok') return data;
-            const msg = (data && (data.message || data.status)) || 'unknown response';
-            this.log('Friendship API not ok (' + msg + '), backing off 10m… (attempt ' + (attempt + 1) + '/' + maxAttempts + ')');
-            this.setLoadProgress({
-                step: 'rate_limit_backoff',
-                detail: 'API: ' + msg + ' — waiting ~10 min, retry ' + (attempt + 1) + '/' + maxAttempts,
-                backoffAttempt: attempt + 1,
-                backoffMax: maxAttempts,
-            });
-            await this.interruptibleSleep(RATE_LIMIT_MS, () => this.bumpLoadProgress());
-        }
-        throw new Error('Friendship API: still not ok after ' + maxAttempts + ' waits');
+            return out;
+        };
+
+        let { data, res } = await tryOnce();
+        if (res.ok && data && data.status === 'ok') return data;
+
+        const firstDetail = !res.ok
+            ? 'HTTP ' + res.status
+            : ((data && (data.message || data.status)) || 'unknown response');
+        this.log('Friendship request failed (' + firstDetail + '), retrying once…');
+        this.setLoadProgress({
+            step: 'http_in_flight',
+            detail: 'Retry 2/2 — ' + firstDetail,
+        });
+
+        ({ data, res } = await tryOnce());
+        if (res.ok && data && data.status === 'ok') return data;
+
+        const secondDetail = !res.ok
+            ? 'HTTP ' + res.status
+            : ((data && (data.message || data.status)) || 'unknown response');
+        this.log('Friendship API failed after retry: ' + secondDetail);
+        throw new Error('Friendship API: ' + secondDetail);
     }
 
     notFollowingBack(following, followers) {
@@ -591,60 +538,67 @@ class InstaUnfollowRunner {
                 .map((s) => (typeof s === 'string' ? s.trim().replace(/^@+/, '').toLowerCase() : ''))
                 .filter(Boolean),
         );
-        this.log('Unfollowing from cache: ' + targets.length + ' account(s)');
+        let toUnfollowCount = 0;
+        for (const u of targets) {
+            const un = u && u.username != null ? String(u.username).trim().replace(/^@+/, '').toLowerCase() : '';
+            if (un && whitelistSet.has(un)) continue;
+            toUnfollowCount++;
+        }
+        this.log('Unfollowing from cache: ' + targets.length + ' account(s), ' + toUnfollowCount + ' to unfollow (after whitelist)');
         targets.forEach((u) => this.log('  @' + u.username));
         let skippedWhitelist = 0;
         let unfollowed = 0;
         let failed = 0;
-        const total = targets.length;
+        let unfollowOrdinal = 0;
+        if (toUnfollowCount === 0) {
+            this.log('Everyone in the list is whitelisted — nothing to unfollow.');
+            this.setResult({
+                ok: true,
+                command: 'unfollow',
+                summary: { targets: targets.length, skippedWhitelist: targets.length, unfollowed: 0, failed: 0 },
+            });
+            this.log('Done.');
+            return;
+        }
         try {
             this.setLoadProgress({
                 job: 'unfollow',
-                total,
+                total: toUnfollowCount,
                 current: 0,
                 cacheRemaining: this.countUnfollowersInCache(),
                 step: 'starting',
-                detail: 'Starting unfollow run',
+                detail: 'Starting unfollow run (' + toUnfollowCount + ' unfollows, ' + targets.length + ' in list)',
             });
             for (let i = 0; i < targets.length; i++) {
                 const u = targets[i];
-                const current = i + 1;
                 this.throwIfCancelled();
-                this.setLoadProgress({
-                    job: 'unfollow',
-                    total,
-                    current,
-                    activeUser: u.username,
-                    cacheRemaining: this.countUnfollowersInCache(),
-                    step: 'account',
-                    detail: 'Account ' + current + ' of ' + total,
-                });
                 const uname = u && u.username != null ? String(u.username).trim().replace(/^@+/, '').toLowerCase() : '';
                 if (uname && whitelistSet.has(uname)) {
                     this.log('Skip whitelist @' + u.username);
                     skippedWhitelist++;
                     this.setLoadProgress({
                         job: 'unfollow',
-                        total,
-                        current,
+                        total: toUnfollowCount,
+                        current: unfollowOrdinal,
                         activeUser: u.username,
                         cacheRemaining: this.countUnfollowersInCache(),
                         step: 'skipped_whitelist',
-                        detail: 'Skipped (whitelist)',
+                        detail: 'Whitelist · list row ' + (i + 1) + '/' + targets.length,
                     });
                     continue;
                 }
-                const ok = await this.unfollowOne(u, current, total);
+                unfollowOrdinal++;
+                const ok = await this.unfollowOne(u, unfollowOrdinal, toUnfollowCount);
                 if (ok) unfollowed++;
                 else failed++;
                 this.setLoadProgress({
                     job: 'unfollow',
-                    total,
-                    current,
+                    total: toUnfollowCount,
+                    current: unfollowOrdinal,
                     activeUser: u.username,
                     cacheRemaining: this.countUnfollowersInCache(),
                     step: ok ? 'done_user' : 'failed_user',
-                    detail: ok ? 'Unfollowed @' + u.username : 'Failed or skipped @' + u.username,
+                    detail: ok ? 'Unfollowed @' + u.username : 'Failed @' + u.username + ' (see log)',
                 });
                 if (!ok) await this.interruptibleSleep(this.randomBetween(45_000, 120_000), () => this.bumpLoadProgress());
             }
@@ -726,21 +680,48 @@ class InstaUnfollowRunner {
         const res = await fetch(ORIGIN + '/web/friendships/' + friendshipId + '/unfollow/', {
             method: 'POST',
             credentials: 'include',
-            headers: unfollowHeaders,
+            headers: {
+                ...unfollowHeaders,
+                accept: 'application/json',
+            },
         });
         this.bumpLoadProgress();
+        const responseText = await res.text();
+        const contentType = (res.headers.get('content-type') || '').split(';')[0].trim();
         if (res.status === 429) {
-            this.log('429 on unfollow ' + user.username + ' — wait and retry later');
+            this.log('429 on unfollow @' + user.username + ' — wait and retry later');
             return false;
         }
         let body;
         try {
-            body = JSON.parse(await res.text());
+            body = JSON.parse(responseText);
         } catch {
+            const preview = responseText.replace(/\s+/g, ' ').trim().slice(0, 400);
+            const looksHtml =
+                /^(\s*<!DOCTYPE|\s*<html)/i.test(responseText) || responseText.includes('<html');
+            this.log(
+                'Unfollow @' +
+                    user.username +
+                    ': not JSON (HTTP ' +
+                    res.status +
+                    ', Content-Type: ' +
+                    (contentType || '—') +
+                    '). ' +
+                    (looksHtml
+                        ? 'Instagram returned HTML instead of JSON (session/checkpoint/login or anti-bot). Hard-refresh instagram.com, confirm you are logged in, then try Unfollow again.'
+                        : 'Preview: ' + (preview || '(empty)')),
+            );
             return false;
         }
         if (body.status !== 'ok') {
-            this.log('Unfollow failed ' + user.username + ': ' + JSON.stringify(body).slice(0, 200));
+            this.log(
+                'Unfollow failed @' +
+                    user.username +
+                    ' HTTP ' +
+                    res.status +
+                    ': ' +
+                    JSON.stringify(body).slice(0, 800),
+            );
             return false;
         }
         this.removeUserFromUnfollowersCache(user);
@@ -751,4 +732,5 @@ class InstaUnfollowRunner {
 
 (function bootstrapInstaUnfollowRunner() {
     new InstaUnfollowRunner().main();
+})();
 })();

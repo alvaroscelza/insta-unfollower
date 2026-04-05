@@ -38,6 +38,27 @@ const TAB_JOB_SESSION_KEYS = [
   '__ig_unfollow_lock__',
 ];
 
+/** True while a job should disable the main buttons. Lock alone is not enough: it can stay set with status=error (duplicate run) or orphan. */
+function isJobActiveFromSession(s) {
+  const st = s.__ig_unfollow_status__ || '';
+  const locked = s.__ig_unfollow_lock__ === '1';
+  if (st === 'running' || st === 'starting') return true;
+  if (locked && st !== 'done' && st !== 'error' && st !== '') return true;
+  return false;
+}
+
+/** Remove orphan lock when status is done or empty (not error — duplicate-run error may race with a live job). */
+async function clearStaleUnfollowLock(tabId, s) {
+  const st = s.__ig_unfollow_status__ || '';
+  if (s.__ig_unfollow_lock__ !== '1' || isJobActiveFromSession(s)) return;
+  if (st !== 'done' && st !== '') return;
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: () => sessionStorage.removeItem('__ig_unfollow_lock__'),
+  });
+}
+
 function startTabJobPoll(tabId) {
   clearTabJobPoll();
   tabJobPollId = setInterval(async () => {
@@ -47,9 +68,7 @@ function startTabJobPoll(tabId) {
       logEl.textContent = logText;
       logEl.scrollTop = logEl.scrollHeight;
       setLoadProgressUi(snap.__ig_load_progress__);
-      const st = snap.__ig_unfollow_status__ || '';
-      const locked = snap.__ig_unfollow_lock__ === '1';
-      if (!locked && st !== 'running' && st !== 'starting') {
+      if (!isJobActiveFromSession(snap)) {
         clearTabJobPoll();
         hideLoadProgressUi();
         await syncUiFromTab(tabId);
@@ -217,12 +236,12 @@ async function downloadCachedUnfollowersTxt() {
 }
 
 function formatLoadProgressLine(progressJson, nowMs) {
-  if (!progressJson) return { main: '', sub: '', hint: '' };
+  if (!progressJson) return { main: '', hint: '' };
   let p;
   try {
     p = JSON.parse(progressJson);
   } catch {
-    return { main: '(Unreadable progress)', sub: '', hint: '' };
+    return { main: '(Unreadable progress)', hint: '' };
   }
   const ageSec = (nowMs - (p.lastActivityAt || 0)) / 1000;
   let main = '';
@@ -245,12 +264,6 @@ function formatLoadProgressLine(progressJson, nowMs) {
     if (p.detail) parts.push(p.detail);
     main = parts.join(' · ');
   }
-  const ageStr =
-    ageSec < 1.5
-      ? 'Last activity: just now'
-      : ageSec < 120
-        ? 'Last activity: ' + Math.round(ageSec) + 's ago'
-        : 'Last activity: ' + Math.round(ageSec / 60) + 'm ago';
   let hint = '';
   if (p.job === 'unfollow') {
     if ((p.step === 'fetch_profile' || p.step === 'unfollow_post') && ageSec > 50) {
@@ -272,21 +285,19 @@ function formatLoadProgressLine(progressJson, nowMs) {
       hint = 'No updates for a while — job may be stuck; try Stop, then reload instagram.com.';
     }
   }
-  return { main, sub: ageStr, hint };
+  return { main, hint };
 }
 
 function setLoadProgressUi(progressJson) {
   if (!loadProgressEl || !loadProgressTextEl) return;
-  const { main, sub, hint } = formatLoadProgressLine(progressJson, Date.now());
-  if (!main && !sub) {
+  const { main, hint } = formatLoadProgressLine(progressJson, Date.now());
+  if (!main && !hint) {
     loadProgressEl.hidden = true;
     loadProgressTextEl.textContent = '';
     return;
   }
   loadProgressEl.hidden = false;
-  const lines = [main, sub];
-  if (hint) lines.push(hint);
-  loadProgressTextEl.textContent = lines.filter(Boolean).join('\n');
+  loadProgressTextEl.textContent = [main, hint].filter(Boolean).join('\n');
 }
 
 function hideLoadProgressUi() {
@@ -331,9 +342,7 @@ async function syncUiFromTab(tabId) {
   else if (s.__ig_unfollowers_ready__ !== '1') unfollowersCountEl.textContent = '—';
   logEl.textContent = s.__ig_unfollow_log__ || '';
   logEl.scrollTop = logEl.scrollHeight;
-  const status = s.__ig_unfollow_status__ || '';
-  const locked = s.__ig_unfollow_lock__ === '1';
-  const jobActive = locked || status === 'running' || status === 'starting';
+  const jobActive = isJobActiveFromSession(s);
   if (jobActive) {
     setLoadProgressUi(s.__ig_load_progress__);
     btnRefreshCounts.disabled = true;
@@ -349,6 +358,7 @@ async function syncUiFromTab(tabId) {
     btnLoadUnfollowers.disabled = !hasUser;
     setUnfollowersCacheUi(s.__ig_unfollowers_ready__ === '1');
   }
+  await clearStaleUnfollowLock(tabId, s);
 }
 
 async function getActiveInstagramTab() {
@@ -367,7 +377,31 @@ async function requestStopCurrentJob() {
   await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     world: 'MAIN',
-    func: () => sessionStorage.setItem('__ig_unfollow_cancel__', '1'),
+    func: () => {
+      sessionStorage.setItem('__ig_unfollow_cancel__', '1');
+      if (window.__ig_force_unlock_timer) {
+        clearTimeout(window.__ig_force_unlock_timer);
+        window.__ig_force_unlock_timer = null;
+      }
+      window.__ig_force_unlock_timer = setTimeout(() => {
+        window.__ig_force_unlock_timer = null;
+        const st = sessionStorage.getItem('__ig_unfollow_status__');
+        if (st === 'running' || st === 'starting') {
+          sessionStorage.removeItem('__ig_unfollow_lock__');
+          sessionStorage.setItem('__ig_unfollow_status__', 'done');
+          sessionStorage.setItem(
+            '__ig_unfollow_result__',
+            JSON.stringify({ ok: false, cancelled: true, forcedUnlock: true }),
+          );
+          sessionStorage.removeItem('__ig_load_progress__');
+          const prev = sessionStorage.getItem('__ig_unfollow_log__') || '';
+          sessionStorage.setItem(
+            '__ig_unfollow_log__',
+            prev + '\n[Forced unlock after Stop — a request may still finish in the background]\n',
+          );
+        }
+      }, 5000);
+    },
   });
   appendLog(logEl.textContent + '\n[Stop requested — job should wind down shortly]\n');
 }
@@ -387,7 +421,11 @@ async function pollProgress(tabId) {
     });
     const status = snap && snap.status;
     const logText = (snap && snap.log) || '';
-    appendLog(logText || '…');
+    const placeholder =
+      !logText && (status === 'starting' || status === 'running')
+        ? 'Waiting for Instagram tab…'
+        : '…';
+    appendLog(logText || placeholder);
     setLoadProgressUi(snap && snap.progress);
     if (status === 'done' || status === 'error') {
       hideLoadProgressUi();
@@ -430,6 +468,7 @@ async function runPhase(tabId, config) {
       world: 'MAIN',
       files: ['page_runner.js'],
     });
+    await new Promise((r) => setTimeout(r, 50));
     const { status, resultJson } = await pollProgress(tabId);
     if (status === 'timeout') {
       logTailAfterSync = '\n[Polling stopped after 1h]';
