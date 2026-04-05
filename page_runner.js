@@ -10,8 +10,10 @@ const MIN_GAP_MS = 2000;
 const MAX_PER_MIN = 18;
 const PAGINATION_MIN = 2000;
 const PAGINATION_MAX = 4000;
-const UNFOLLOW_MIN = 6000;
-const UNFOLLOW_MAX = 14_000;
+const UNFOLLOW_MIN = 4000;
+const UNFOLLOW_MAX = 10_000;
+const UNFOLLOW_BATCH_PAUSE_EVERY = 15;
+const UNFOLLOW_BATCH_PAUSE_MS = 60_000;
 const BETWEEN_PAGE_UNFOLLOW_MIN = 2000;
 const BETWEEN_PAGE_UNFOLLOW_MAX = 5000;
 const FRIENDSHIP_PAGE_COUNT = 200;
@@ -588,9 +590,51 @@ class InstaUnfollowRunner {
                     continue;
                 }
                 unfollowOrdinal++;
-                const ok = await this.unfollowOne(u, unfollowOrdinal, toUnfollowCount);
-                if (ok) unfollowed++;
-                else failed++;
+                let ok = false;
+                try {
+                    ok = await this.unfollowOne(u, unfollowOrdinal, toUnfollowCount);
+                } catch (e) {
+                    if (e && e.name === 'InstagramHtmlStop') {
+                        failed++;
+                        this.setLoadProgress({
+                            job: 'unfollow',
+                            total: toUnfollowCount,
+                            current: unfollowOrdinal,
+                            activeUser: u.username,
+                            cacheRemaining: this.countUnfollowersInCache(),
+                            step: 'stopped_instagram_html',
+                            detail: 'Run stopped (HTML response)',
+                        });
+                        this.log('Unfollow run stopped: ' + e.message);
+                        this.setResult({
+                            ok: false,
+                            command: 'unfollow',
+                            error: e.message,
+                            stoppedByInstagramHtml: true,
+                            summary: { targets: targets.length, skippedWhitelist, unfollowed, failed },
+                        });
+                        this.log('Done.');
+                        return;
+                    }
+                    throw e;
+                }
+                if (ok) {
+                    unfollowed++;
+                    if (unfollowed % UNFOLLOW_BATCH_PAUSE_EVERY === 0) {
+                        this.setLoadProgress({
+                            job: 'unfollow',
+                            total: toUnfollowCount,
+                            current: unfollowOrdinal,
+                            activeUser: u.username,
+                            cacheRemaining: this.countUnfollowersInCache(),
+                            step: 'batch_pause',
+                            detail: '1 min pause after ' + unfollowed + ' unfollows',
+                        });
+                        await this.interruptibleSleep(UNFOLLOW_BATCH_PAUSE_MS, () => this.bumpLoadProgress());
+                    }
+                } else {
+                    failed++;
+                }
                 this.setLoadProgress({
                     job: 'unfollow',
                     total: toUnfollowCount,
@@ -699,6 +743,9 @@ class InstaUnfollowRunner {
             const preview = responseText.replace(/\s+/g, ' ').trim().slice(0, 400);
             const looksHtml =
                 /^(\s*<!DOCTYPE|\s*<html)/i.test(responseText) || responseText.includes('<html');
+            const detailMsg = looksHtml
+                ? 'Instagram returned HTML instead of JSON (session/checkpoint/login or anti-bot). Hard-refresh instagram.com, confirm you are logged in, then try Unfollow again.'
+                : 'Preview: ' + (preview || '(empty)');
             this.log(
                 'Unfollow @' +
                     user.username +
@@ -707,10 +754,15 @@ class InstaUnfollowRunner {
                     ', Content-Type: ' +
                     (contentType || '—') +
                     '). ' +
-                    (looksHtml
-                        ? 'Instagram returned HTML instead of JSON (session/checkpoint/login or anti-bot). Hard-refresh instagram.com, confirm you are logged in, then try Unfollow again.'
-                        : 'Preview: ' + (preview || '(empty)')),
+                    detailMsg,
             );
+            if (looksHtml) {
+                const stop = new Error(
+                    'Instagram returned HTML instead of JSON (checkpoint/login/anti-bot). The unfollow run was stopped; hard-refresh instagram.com, confirm you are logged in, then start Unfollow again.',
+                );
+                stop.name = 'InstagramHtmlStop';
+                throw stop;
+            }
             return false;
         }
         if (body.status !== 'ok') {
