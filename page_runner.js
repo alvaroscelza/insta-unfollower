@@ -13,7 +13,7 @@ const PAGINATION_MAX = 4000;
 const UNFOLLOW_MIN = 4000;
 const UNFOLLOW_MAX = 10_000;
 const UNFOLLOW_BATCH_PAUSE_EVERY = 15;
-const UNFOLLOW_BATCH_PAUSE_MS = 300_000;
+const UNFOLLOW_BATCH_PAUSE_MS = 600_000;
 const BETWEEN_PAGE_UNFOLLOW_MIN = 2000;
 const BETWEEN_PAGE_UNFOLLOW_MAX = 5000;
 const FRIENDSHIP_PAGE_COUNT = 200;
@@ -628,7 +628,7 @@ class InstaUnfollowRunner {
                             activeUser: u.username,
                             cacheRemaining: this.countUnfollowersInCache(),
                             step: 'batch_pause',
-                            detail: '5 min pause after ' + unfollowed + ' unfollows',
+                            detail: '10 min pause after ' + unfollowed + ' unfollows',
                         });
                         await this.interruptibleSleep(UNFOLLOW_BATCH_PAUSE_MS, () => this.bumpLoadProgress());
                     }
